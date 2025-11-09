@@ -12,7 +12,7 @@ Script to scrape and download content from the JustFor.Fans website. Supports Te
     ```
 1. Install requirements: `pip install -r requirements.txt`
 2. Set configuration
-    1. `overwrite_existing` - will skip download if file exists (set to True to save on processing and downloading)
+    1. `overwrite_existing` - will skip download if file exists (keep this False to save on processing and downloading on subsequent runs)
     2. `save_path` - destination folder - will save to same location as script folder if none provided
     3. `save_full_text` - will save text file with full description
     4. `file_name_format` - filename format, following values are available:
@@ -39,4 +39,4 @@ Note that leaving PosterID blank will result in the tool downloading all posts f
 
 ## Contributors
 
-This tool builds upon the work of [whats-happening-rightnow' justfor.fans.ripper](https://github.com/whats-happening-rightnow/justfor.fans.ripper) and its forks ([edwardsdean](https://github.com/edwardsdean/justfor.fans.ripper), [VeryEvilHumna](https://github.com/VeryEvilHumna/justfor.fans.ripper)).
+This tool builds upon the work of [whats-happening-rightnow's justfor.fans.ripper](https://github.com/whats-happening-rightnow/justfor.fans.ripper) and its forks ([edwardsdean](https://github.com/edwardsdean/justfor.fans.ripper), [VeryEvilHumna](https://github.com/VeryEvilHumna/justfor.fans.ripper)).
