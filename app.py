@@ -12,14 +12,31 @@ import bs4
 import cloudscraper
 import subprocess
 import configparser
+import concurrent.futures
+import threading
+
+# Force all subprocesses to use UTF-8, which prevents the 'charmap' codec errors
+os.environ['PYTHONIOENCODING'] = 'utf-8'
 
 from yt_dlp import YoutubeDL
+
+# --- Globals ---
+config = configparser.ConfigParser(allow_no_value=True)
 scraper = cloudscraper.create_scraper(browser={
         'browser': 'chrome',
         'platform': 'android',
         'desktop': False
     })
 
+user_hash = ""
+poster_id = ""
+
+current_offset = 0
+offset_lock = threading.Lock()
+
+stop_event = threading.Event()
+print_lock = threading.Lock()
+# --- End Globals ---
 
 class Post:
     def __init__(self, post_soup: bs4.Tag):
@@ -146,7 +163,9 @@ def create_folder(post: Post) -> str:
 
 
 def photo_save(post: Post):
-    print("Downloading Photo : %s" % post.basename)
+    # Use thread-safe print
+    with print_lock:
+        print("Downloading Photo : %s" % post.basename)
 
     photos_url = []
 
@@ -213,6 +232,7 @@ def decrypt_file_internal(path, hex_key):
         '-i', path,
         '-c', 'copy',  # Copy codec, don't re-encode
         '-y',          # Overwrite output
+        '-loglevel', 'error', # Quieter output
         out_path
     ]
     
@@ -220,7 +240,9 @@ def decrypt_file_internal(path, hex_key):
     shutil.move(out_path, path)
 
 def video_save(post: Post):
-    print("Downloading Video : %s" % post.basename)
+    # Use thread-safe print
+    with print_lock:
+        print("Downloading Video : %s" % post.basename)
 
     folder = create_folder(post)
     vpath = os.path.join(folder, post.basename) + ".mp4"
@@ -241,9 +263,11 @@ def video_save(post: Post):
         videoBlock = post.post_soup.select("div.videoBlock a")
         if len(videoBlock) == 0:
             if post.store_url is None:
-                print("Get video URL failed: %s" % post.basename[:30])
+                with print_lock:
+                    print("Get video URL failed: %s" % post.basename[:30])
             else:
-                print("Store post: %s" % post.basename[:30])
+                with print_lock:
+                    print("Store post: %s" % post.basename[:30])
             return
         vidurljumble = videoBlock[0].attrs["onclick"]
 
@@ -274,8 +298,9 @@ def video_save(post: Post):
         ydl_opts = {
             "quiet": True,
             "no_warnings": True,
+            "concurrent_fragment_downloads": max(int(config.get('General', 'concurrent_fragments')), 1),
             "retries": 10,
-            "concurrent_fragment_downloads": 8,
+            "file_access_retries": 10,
             "updatetime": True,
             "noprogress": True,
             "outtmpl": temp_path,
@@ -306,6 +331,7 @@ def video_save(post: Post):
             '-c', 'copy',  # Copy the video codec
             '-y',          # Overwrite output file if it exists
             '-shortest',
+            '-loglevel', 'error', # Quieter output
             vpath
         ]
         subprocess.run(merge_command, check=True, capture_output=True, text=True, encoding='utf-8', errors='ignore')
@@ -317,12 +343,13 @@ def video_save(post: Post):
         sys.exit(0)
     except Exception:
         import traceback
-
-        print(traceback.format_exc())
+        with print_lock:
+            print(traceback.format_exc())
 
 
 def text_save(post: Post):
-    print("Downloading Text :  %s" % post.basename)
+    with print_lock:
+        print("Downloading Text :  %s" % post.basename)
 
     folder = create_folder(post)
     tpath = os.path.join(folder, post.basename) + ".txt"
@@ -350,16 +377,26 @@ def text_save(post: Post):
         file.close()
 
 
-def parse_and_get(html_text: str):
+def parse_and_get(html_text: str) -> bool:
+    """
+    Parses the HTML and processes all found posts.
+    Returns True if posts were found, False if not.
+    """
     soup = bs4.BeautifulSoup(html_text, "html.parser")
+    
+    posts = soup.select("div.mbsc-card.jffPostClass")
+    if not posts:
+        return False # No posts found
 
-    for pp in soup.select("div.mbsc-card.jffPostClass"):
+    post_count = 0
+    for pp in posts:
         try:
             if "donotremove" in pp.get("class"):
                 # Skip "Whom To Follow"
                 continue
 
             post = Post(pp)
+            post_count += 1
 
             if post.type == "shoutout":
                 # Skip "Shoutout Post"
@@ -377,20 +414,25 @@ def parse_and_get(html_text: str):
                     text_save(post)
 
             if post.post_date == "Unknown Date":
-                print("================================")
-                print("[WARN] Unknown Date")
-                print(pp.prettify())
-                print("================================")
+                with print_lock:
+                    print("================================")
+                    print("[WARN] Unknown Date")
+                    print(pp.prettify())
+                    print("================================")
 
         except KeyboardInterrupt:
+            stop_event.set() # Signal stop
             sys.exit(0)
         except Exception:
-            print("================================")
-            print(pp.prettify())
-            import traceback
+            with print_lock:
+                print("================================")
+                print(pp.prettify())
+                import traceback
 
-            print(traceback.format_exc())
-            print("================================")
+                print(traceback.format_exc())
+                print("================================")
+    
+    return post_count > 0 # Return True if we found any posts
 
 
 def get_html(loopct: int) -> str:
@@ -407,13 +449,55 @@ def get_html(loopct: int) -> str:
     html_text = scraper.get(geturl).text
     return html_text
 
+# --- Thread-safe offset getter ---
+def get_next_offset() -> int:
+    """Fetches the next page offset in a thread-safe way."""
+    global current_offset
+    with offset_lock:
+        offset = current_offset
+        current_offset += 10  # Increment for the next thread
+        return offset
 
+# --- Worker function for dynamic threading ---
+def process_page_worker():
+    """
+    Worker thread target. Continuously fetches and processes pages until the stop_event is set.
+    """
+    while not stop_event.is_set():
+        loopct = get_next_offset()
+        
+        try:
+            html_text = get_html(loopct)
+
+            if "as sad as you are" in html_text:
+                with print_lock:
+                    print(f"[Thread] No more posts found at offset {loopct}. Signaling stop.")
+                stop_event.set()  # Signal all other threads to stop
+                break  # Exit this thread's loop
+            else:
+                # parse_and_get returns True if posts were found, False if not
+                if not parse_and_get(html_text):
+                    # This can happen on empty pages at the end
+                    with print_lock:
+                         print(f"[Thread] Page offset {loopct} was empty or failed. Signaling stop.")
+                    stop_event.set()
+                    break
+
+        except KeyboardInterrupt:
+            stop_event.set()
+            break
+        except Exception:
+            with print_lock:
+                print(f"[!] Error in thread for offset {loopct}:")
+                import traceback
+                print(traceback.format_exc())
+            # Don't stop on an individual page error, just get the next one
+            continue
+
+# --- Main execution block ---
 if __name__ == "__main__":
-    config = configparser.ConfigParser(allow_no_value=True)
     config.read('config.ini')
-
-    user_hash = ""
-    poster_id = ""
+    max_workers = max(int(config.get('General', 'max_workers')), 1)
 
     if len(sys.argv) >= 2:
         user_hash = sys.argv[1]
@@ -432,24 +516,32 @@ if __name__ == "__main__":
         )
         sys.exit(0)
     else:
-        print("(%s) Using user hash from config file." % user_hash)
+        if len(sys.argv) < 2: # Only print if it came from config
+            print("(%s) Using user hash from config file." % user_hash)
 
     if poster_id == "":
         poster_id = config.get('Poster', 'poster_id', fallback="")
-        if poster_id:
+        if poster_id and len(sys.argv) < 3: # Only print if it came from config
             print("(%s) Using poster ID from config file." % poster_id)
+    
+    # Set the global start offset
+    current_offset = 0
+    
+    print(f"[Main] Starting download process with up to {max_workers} threads...")
 
-    loopit = True
-    loopct: int = 0
-    while loopit:
-        html_text = get_html(loopct)
-
-        if "as sad as you are" in html_text:
-            print("(%s) No more posts to parse. Exiting." % user_hash)
-            print(
-                "If program has not downloaded any files, your token might be expired or invalid. Get a new one."
-            )
-            loopit = False
-        else:
-            parse_and_get(html_text)
-            loopct += 10
+    # --- Dynamic Thread Pool Executor ---
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit one worker for each slot in the pool
+            futures = [executor.submit(process_page_worker) for _ in range(max_workers)]
+            
+            # This will wait for all threads to complete
+            # Threads will complete when stop_event is set and they finish their last job
+            concurrent.futures.wait(futures)
+            
+    except KeyboardInterrupt:
+        print("\n[Main] Keyboard interrupt received. Shutting down threads...")
+        stop_event.set()
+        # The 'with' block will handle shutting down the executor
+        
+    print("[Main] All download threads have finished.")
