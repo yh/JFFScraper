@@ -19,6 +19,7 @@ import threading
 os.environ['PYTHONIOENCODING'] = 'utf-8'
 
 from yt_dlp import YoutubeDL
+from database import Database
 
 # --- Globals ---
 config = configparser.ConfigParser(allow_no_value=True)
@@ -38,8 +39,18 @@ stop_event = threading.Event()
 print_lock = threading.Lock()
 # --- End Globals ---
 
+
+def get_db(uploader_id: str) -> Database:
+    """Get or create the database for a specific uploader."""
+    db_dir = os.path.join(config.get('Paths', 'save_path'), uploader_id)
+    if not os.path.exists(db_dir):
+        os.makedirs(db_dir)
+    db_path = os.path.join(db_dir, 'metadata.db')
+    return Database.get_instance(db_path)
+
 class Post:
     def __init__(self, post_soup: bs4.Tag):
+        self.db_id = None  # Set after database insertion
         self.post_soup = post_soup
 
         ptext = post_soup.select("div.fr-view")
@@ -121,18 +132,65 @@ class Post:
                     )
                     self.upload_date = dt.strftime("%Y-%m-%d")
                     self.upload_date_iso = dt.isoformat()
-                    self.post_date = self.upload_date
-                    self.post_date_iso = self.upload_date_iso
+
+            # Use data-server-time for post_date (more reliable than text parsing)
+            server_time = card_subtitle[0].get("data-server-time")
+            if server_time:
+                dt = datetime.datetime.strptime(server_time, "%Y-%m-%d %H:%M:%S")
+                self.post_date = dt.strftime("%Y-%m-%d")
+                self.post_date_iso = dt.isoformat()
         except:
             pass
 
-        try:
-            dt_format = "%B %d, %Y, %I:%M %p"
-            dt = datetime.datetime.strptime(self.post_date_str, dt_format)
-            self.post_date = dt.strftime("%Y-%m-%d")
-            self.post_date_iso = dt.isoformat()
-        except:
-            pass
+        # Fallback: parse human-readable date if data-server-time not available
+        if self.post_date == "Unknown Date":
+            try:
+                dt_format = "%B %d, %Y, %I:%M %p"
+                dt = datetime.datetime.strptime(self.post_date_str, dt_format)
+                self.post_date = dt.strftime("%Y-%m-%d")
+                self.post_date_iso = dt.isoformat()
+            except:
+                pass
+
+        # Fallback for pinned posts: extract timestamp from video overlay ID or gridAction postHash
+        if self.post_date in ("Unknown Date", "Pinned"):
+            try:
+                # Try video overlay: id="overlay-Posts-{user_id}-MC-{timestamp}"
+                overlay = post_soup.select_one("div.video-thumbnail[id^='overlay-Posts-']")
+                if overlay:
+                    overlay_id = overlay.get("id", "")
+                    mc_match = re.search(r"-MC-(\d+)", overlay_id)
+                    if mc_match:
+                        ts = int(mc_match.group(1))
+                        dt = datetime.datetime.fromtimestamp(ts * 0.001)
+                        self.post_date = dt.strftime("%Y-%m-%d")
+                        self.post_date_iso = dt.isoformat()
+                        if self.upload_date == "Unknown Date":
+                            self.upload_date = self.post_date
+                            self.upload_date_iso = self.post_date_iso
+            except:
+                pass
+
+        # Another fallback: gridAction onclick contains postHash with timestamp
+        if self.post_date in ("Unknown Date", "Pinned"):
+            try:
+                grid_action = post_soup.select_one("a.gridAction")
+                if grid_action:
+                    onclick = grid_action.get("onclick", "")
+                    hash_match = re.search(r'postHash:\s*["\']([^"\']+)["\']', onclick)
+                    if hash_match:
+                        post_hash = hash_match.group(1)
+                        mc_match = re.search(r"-MC-(\d+)", post_hash)
+                        if mc_match:
+                            ts = int(mc_match.group(1))
+                            dt = datetime.datetime.fromtimestamp(ts * 0.001)
+                            self.post_date = dt.strftime("%Y-%m-%d")
+                            self.post_date_iso = dt.isoformat()
+                            if self.upload_date == "Unknown Date":
+                                self.upload_date = self.post_date
+                                self.upload_date_iso = self.post_date_iso
+            except:
+                pass
 
         self.excerpt = self.full_text
         self.excerpt = re.sub(r'[\\\/:*?"<>|\s]', " ", self.excerpt)
@@ -167,12 +225,12 @@ def photo_save(post: Post):
     with print_lock:
         print("Downloading Photo : %s" % post.basename)
 
-    photos_url = []
-
     photos_img = post.post_soup.select("div.imageGallery.galleryLarge img.expandable")
 
     if len(photos_img) == 0:
         photos_img.append(post.post_soup.select("img.expandable")[0])
+
+    db = get_db(post.uploader_id)
 
     for i, img in enumerate(photos_img):
         if "src" in img.attrs:
@@ -189,32 +247,46 @@ def photo_save(post: Post):
             [os.path.join(folder, "{}.{:02}".format(post.basename, i)), ext]
         )
 
-        exists = (
-            len(
-                glob.glob(
-                    os.path.join(folder, post.basename[:50])
-                    + "*.{:02}.{}".format(i, ext)
-                )
-            )
-            > 0
+        # Check for existing file
+        existing_files = glob.glob(
+            os.path.join(folder, post.basename[:50]) + "*.{:02}.{}".format(i, ext)
         )
+        exists = len(existing_files) > 0
+        existing_path = existing_files[0] if exists else None
+
+        # Always insert/update media record
+        media_id = None
+        if post.db_id:
+            media_id = db.insert_media(
+                post_db_id=post.db_id,
+                media_type="photo",
+                url=imgsrc
+            )
+
+        # Skip download if file exists
         if not config.getboolean('General', 'overwrite_existing') and exists:
-            # print(f'p: <<exists skip>>: {ppath}')
+            # Update media with existing file info
+            if media_id and existing_path:
+                file_size = os.path.getsize(existing_path) if os.path.exists(existing_path) else None
+                db.update_media(media_id, file_path=existing_path, file_size=file_size)
             continue
 
-        photos_url.append((ppath, imgsrc))
-
-    for img in photos_url:
-        ppath, imgsrc = img
         tmp_ppath = ppath + ".tmp"
 
         try:
             response = scraper.get(imgsrc, stream=True)
+
             # print("Downloading " + str(round(int(response.headers.get('content-length'))/1024/1024, 2)) + " MB")
             with open(tmp_ppath, "wb") as out_file:
                 shutil.copyfileobj(response.raw, out_file)
             del response
             os.rename(tmp_ppath, ppath)
+
+            # Update media with file path and size
+            if media_id:
+                file_size = os.path.getsize(ppath) if os.path.exists(ppath) else None
+                db.update_media(media_id, file_path=ppath, file_size=file_size)
+
         except KeyboardInterrupt:
             sys.exit(0)
         except Exception:
@@ -248,16 +320,15 @@ def video_save(post: Post):
     vpath = os.path.join(folder, post.basename) + ".mp4"
 
     downloading = next(
-        iter(glob.glob(os.path.join(folder, f"* - {post.pid} - *.ytdl"))), None
+        iter(glob.glob(os.path.join(folder, f"* - {post.pid} -*.ytdl"))), None
     )
     downloaded = next(
-        iter(glob.glob(os.path.join(folder, f"* - {post.pid} - *.mp4"))), None
+        iter(glob.glob(os.path.join(folder, f"* - {post.pid} -*.mp4"))), None
     )
     exists = downloading is None and downloaded is not None
-    if not config.getboolean('General', 'overwrite_existing') and exists:
-        if downloaded is not None and downloaded != vpath:
-            os.rename(downloaded, vpath)
-        return
+
+    db = get_db(post.uploader_id)
+    media_id = None
 
     try:
         videoBlock = post.post_soup.select("div.videoBlock a")
@@ -276,10 +347,13 @@ def video_save(post: Post):
 
         vidurl = json.loads(vidurl_json_str)
         url = vidurl.get("All", "")
+        quality = "All"
         if url == "":
             url = vidurl.get("1080p", "")
+            quality = "1080p"
         if url == "":
             url = vidurl.get("540p", "")
+            quality = "540p"
 
         # print("URL: %s" % url)
 
@@ -288,9 +362,32 @@ def video_save(post: Post):
         parsed_license_url = urllib.parse.urlparse(license_url)
         query_params = urllib.parse.parse_qs(parsed_license_url.query)
         kid = query_params['kid'][0]
-            
+
         license_response = scraper.get(license_url)
         hex_key = license_response.content.hex()
+
+        # Insert media record with video metadata
+        if post.db_id:
+            media_id = db.insert_media(
+                post_db_id=post.db_id,
+                media_type="video",
+                url=url,
+                quality=quality,
+                license_url=license_url,
+                kid=kid,
+                decryption_key=hex_key
+            )
+
+        # Skip download if file exists
+        if not config.getboolean('General', 'overwrite_existing') and exists:
+            if downloaded is not None and downloaded != vpath:
+                os.rename(downloaded, vpath)
+            # Update media with existing file info
+            final_path = vpath if os.path.exists(vpath) else downloaded
+            if media_id and final_path:
+                file_size = os.path.getsize(final_path) if os.path.exists(final_path) else None
+                db.update_media(media_id, file_path=final_path, file_size=file_size)
+            return
 
         # print("KEY: %s:%s" % (kid, hex_key))
 
@@ -317,7 +414,7 @@ def video_save(post: Post):
 
         for f_path in downloaded_files:
             decrypt_file_internal(f_path, hex_key)
-        
+
         video_file = next((f for f in downloaded_files if f.endswith('.mp4')), None)
         audio_file = next((f for f in downloaded_files if f.endswith('.m4a') or f.endswith('.m4b')), None)
 
@@ -338,6 +435,11 @@ def video_save(post: Post):
 
         for f in downloaded_files:
             os.remove(f)
+
+        # Update media with file path and size
+        if media_id:
+            file_size = os.path.getsize(vpath) if os.path.exists(vpath) else None
+            db.update_media(media_id, file_path=vpath, file_size=file_size)
 
     except KeyboardInterrupt:
         sys.exit(0)
@@ -397,6 +499,16 @@ def parse_and_get(html_text: str) -> bool:
 
             post = Post(pp)
             post_count += 1
+
+            # Insert post into database
+            try:
+                db = get_db(post.uploader_id)
+                raw_html = str(pp) if config.getboolean('Database', 'store_raw_html', fallback=True) else None
+                post.db_id = db.insert_post(post, raw_html=raw_html)
+            except Exception as e:
+                with print_lock:
+                    print(f"Warning: Failed to save post {post.pid} to database: {e}")
+                post.db_id = None
 
             if post.type == "shoutout":
                 # Skip "Shoutout Post"
