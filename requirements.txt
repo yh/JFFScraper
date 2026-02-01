@@ -1,3 +1,4 @@
-beautifulsoup4==4.14.2
-cloudscraper==1.2.71
-yt_dlp==2025.10.22
+beautifulsoup4
+cloudscraper
+yt_dlp
+rich

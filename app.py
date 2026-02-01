@@ -15,6 +15,11 @@ import configparser
 import concurrent.futures
 import threading
 
+from rich.console import Console
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+
 # Force all subprocesses to use UTF-8, which prevents the 'charmap' codec errors
 os.environ['PYTHONIOENCODING'] = 'utf-8'
 
@@ -38,6 +43,156 @@ offset_lock = threading.Lock()
 stop_event = threading.Event()
 print_lock = threading.Lock()
 # --- End Globals ---
+
+
+class ProgressTracker:
+    """Thread-safe progress tracker with rich Live display."""
+
+    def __init__(self):
+        self.console = Console()
+        self.lock = threading.Lock()
+        self.live = None
+        self._enabled = True
+
+        # Counters
+        self.pages_processed = 0
+        self.posts_found = 0
+
+        # Per-type counters: {type: {'downloaded': n, 'skipped': n, 'failed': n}}
+        self.counters = {
+            'photo': {'downloaded': 0, 'skipped': 0, 'failed': 0},
+            'video': {'downloaded': 0, 'skipped': 0, 'failed': 0},
+            'text': {'downloaded': 0, 'skipped': 0},
+        }
+
+        # Current activity per thread
+        self.activities = {}
+
+    def set_enabled(self, enabled: bool):
+        """Enable or disable the progress display."""
+        self._enabled = enabled
+
+    def _render(self) -> Panel:
+        """Render the current progress display."""
+        table = Table.grid(padding=(0, 2))
+        table.add_column()
+        table.add_column(justify="right")
+        table.add_column(justify="right")
+        table.add_column(justify="right")
+
+        # Summary row
+        table.add_row(
+            f"Pages: {self.pages_processed}  |  Posts: {self.posts_found}",
+            "", "", ""
+        )
+        table.add_row("", "", "", "")
+
+        # Header row
+        table.add_row("", "Downloaded", "Skipped", "Failed")
+
+        # Photo row
+        p = self.counters['photo']
+        table.add_row(
+            "Photos:",
+            str(p['downloaded']),
+            str(p['skipped']),
+            str(p['failed'])
+        )
+
+        # Video row
+        v = self.counters['video']
+        table.add_row(
+            "Videos:",
+            str(v['downloaded']),
+            str(v['skipped']),
+            str(v['failed'])
+        )
+
+        # Text row
+        t = self.counters['text']
+        table.add_row(
+            "Texts:",
+            str(t['downloaded']),
+            str(t['skipped']),
+            "N/A"
+        )
+
+        # Activity section
+        if self.activities:
+            table.add_row("", "", "", "")
+            table.add_row("[bold]Current Activity:[/bold]", "", "", "")
+            for _, activity in sorted(self.activities.items()):
+                table.add_row(f"  {activity}", "", "", "")
+
+        return Panel(table, title="JFFScraper Progress", border_style="blue")
+
+    def start(self):
+        """Start the live display."""
+        if not self._enabled:
+            return
+        self.live = Live(self._render(), console=self.console, refresh_per_second=4)
+        self.live.start()
+
+    def stop(self):
+        """Stop the live display and show final summary."""
+        if self.live:
+            self.live.stop()
+            self.live = None
+        self._print_summary()
+
+    def _print_summary(self):
+        """Print final summary to console."""
+        self.console.print()
+        self.console.print("[bold]Download Complete[/bold]")
+        self.console.print(f"  Pages processed: {self.pages_processed}")
+        self.console.print(f"  Posts found: {self.posts_found}")
+        self.console.print()
+        p = self.counters['photo']
+        self.console.print(f"  Photos: {p['downloaded']} downloaded, {p['skipped']} skipped, {p['failed']} failed")
+        v = self.counters['video']
+        self.console.print(f"  Videos: {v['downloaded']} downloaded, {v['skipped']} skipped, {v['failed']} failed")
+        t = self.counters['text']
+        self.console.print(f"  Texts: {t['downloaded']} downloaded, {t['skipped']} skipped")
+
+    def _update_display(self):
+        """Update the live display if running."""
+        if self.live:
+            self.live.update(self._render())
+
+    def increment_page(self):
+        """Increment pages processed counter."""
+        with self.lock:
+            self.pages_processed += 1
+            self._update_display()
+
+    def add_posts(self, count: int):
+        """Add to posts found counter."""
+        with self.lock:
+            self.posts_found += count
+            self._update_display()
+
+    def increment(self, media_type: str, status: str):
+        """Increment a counter for the given media type and status."""
+        with self.lock:
+            if media_type in self.counters and status in self.counters[media_type]:
+                self.counters[media_type][status] += 1
+                self._update_display()
+
+    def set_activity(self, thread_name: str, activity: str):
+        """Set the current activity for a thread."""
+        with self.lock:
+            self.activities[thread_name] = activity
+            self._update_display()
+
+    def clear_activity(self, thread_name: str):
+        """Clear the activity for a thread."""
+        with self.lock:
+            self.activities.pop(thread_name, None)
+            self._update_display()
+
+
+# Global progress tracker (initialized in __main__)
+progress_tracker: ProgressTracker = None
 
 
 def get_db(uploader_id: str) -> Database:
@@ -221,9 +376,9 @@ def create_folder(post: Post) -> str:
 
 
 def photo_save(post: Post):
-    # Use thread-safe print
-    with print_lock:
-        print("Downloading Photo : %s" % post.basename)
+    thread_name = threading.current_thread().name
+    if progress_tracker:
+        progress_tracker.set_activity(thread_name, f"Photo: {post.basename[:50]}")
 
     photos_img = post.post_soup.select("div.imageGallery.galleryLarge img.expandable")
 
@@ -231,6 +386,9 @@ def photo_save(post: Post):
         photos_img.append(post.post_soup.select("img.expandable")[0])
 
     db = get_db(post.uploader_id)
+    downloaded_any = False
+    skipped_any = False
+    failed_any = False
 
     for i, img in enumerate(photos_img):
         if "src" in img.attrs:
@@ -238,7 +396,6 @@ def photo_save(post: Post):
         elif "data-lazy" in img.attrs:
             imgsrc = img.attrs["data-lazy"]
         else:
-            # print("no image source, skipping")
             continue
         ext = imgsrc.split(".")[-1]
 
@@ -269,6 +426,7 @@ def photo_save(post: Post):
             if media_id and existing_path:
                 file_size = os.path.getsize(existing_path) if os.path.exists(existing_path) else None
                 db.update_media(media_id, file_path=existing_path, file_size=file_size)
+            skipped_any = True
             continue
 
         tmp_ppath = ppath + ".tmp"
@@ -276,7 +434,6 @@ def photo_save(post: Post):
         try:
             response = scraper.get(imgsrc, stream=True)
 
-            # print("Downloading " + str(round(int(response.headers.get('content-length'))/1024/1024, 2)) + " MB")
             with open(tmp_ppath, "wb") as out_file:
                 shutil.copyfileobj(response.raw, out_file)
             del response
@@ -287,12 +444,24 @@ def photo_save(post: Post):
                 file_size = os.path.getsize(ppath) if os.path.exists(ppath) else None
                 db.update_media(media_id, file_path=ppath, file_size=file_size)
 
+            downloaded_any = True
+
         except KeyboardInterrupt:
             sys.exit(0)
         except Exception:
             import traceback
+            with print_lock:
+                print(traceback.format_exc())
+            failed_any = True
 
-            print(traceback.format_exc())
+    # Update progress tracker
+    if progress_tracker:
+        if downloaded_any:
+            progress_tracker.increment('photo', 'downloaded')
+        elif skipped_any:
+            progress_tracker.increment('photo', 'skipped')
+        if failed_any:
+            progress_tracker.increment('photo', 'failed')
 
 def decrypt_file_internal(path, hex_key):
     f_base, f_ext = os.path.splitext(path)
@@ -312,9 +481,9 @@ def decrypt_file_internal(path, hex_key):
     shutil.move(out_path, path)
 
 def video_save(post: Post):
-    # Use thread-safe print
-    with print_lock:
-        print("Downloading Video : %s" % post.basename)
+    thread_name = threading.current_thread().name
+    if progress_tracker:
+        progress_tracker.set_activity(thread_name, f"Video: {post.basename[:50]}")
 
     folder = create_folder(post)
     vpath = os.path.join(folder, post.basename) + ".mp4"
@@ -333,12 +502,8 @@ def video_save(post: Post):
     try:
         videoBlock = post.post_soup.select("div.videoBlock a")
         if len(videoBlock) == 0:
-            if post.store_url is None:
-                with print_lock:
-                    print("Get video URL failed: %s" % post.basename[:30])
-            else:
-                with print_lock:
-                    print("Store post: %s" % post.basename[:30])
+            if progress_tracker:
+                progress_tracker.increment('video', 'failed')
             return
         vidurljumble = videoBlock[0].attrs["onclick"]
 
@@ -354,8 +519,6 @@ def video_save(post: Post):
         if url == "":
             url = vidurl.get("540p", "")
             quality = "540p"
-
-        # print("URL: %s" % url)
 
         license_url_str = jumble_args[6] # Arg 7: "https://..."...
         license_url = license_url_str.strip('")')
@@ -387,9 +550,9 @@ def video_save(post: Post):
             if media_id and final_path:
                 file_size = os.path.getsize(final_path) if os.path.exists(final_path) else None
                 db.update_media(media_id, file_path=final_path, file_size=file_size)
+            if progress_tracker:
+                progress_tracker.increment('video', 'skipped')
             return
-
-        # print("KEY: %s:%s" % (kid, hex_key))
 
         temp_path = os.path.join(folder, post.pid)
         ydl_opts = {
@@ -418,9 +581,6 @@ def video_save(post: Post):
         video_file = next((f for f in downloaded_files if f.endswith('.mp4')), None)
         audio_file = next((f for f in downloaded_files if f.endswith('.m4a') or f.endswith('.m4b')), None)
 
-        # print("Video file: %s" % video_file)
-        # print("Audio file: %s" % audio_file)
-
         merge_command = [
             'ffmpeg',
             '-i', video_file,
@@ -441,23 +601,31 @@ def video_save(post: Post):
             file_size = os.path.getsize(vpath) if os.path.exists(vpath) else None
             db.update_media(media_id, file_path=vpath, file_size=file_size)
 
+        if progress_tracker:
+            progress_tracker.increment('video', 'downloaded')
+
     except KeyboardInterrupt:
         sys.exit(0)
     except Exception:
         import traceback
         with print_lock:
             print(traceback.format_exc())
+        if progress_tracker:
+            progress_tracker.increment('video', 'failed')
 
 
 def text_save(post: Post):
-    with print_lock:
-        print("Downloading Text :  %s" % post.basename)
+    thread_name = threading.current_thread().name
+    if progress_tracker:
+        progress_tracker.set_activity(thread_name, f"Text: {post.basename[:50]}")
 
     folder = create_folder(post)
     tpath = os.path.join(folder, post.basename) + ".txt"
 
     exists = len(glob.glob(os.path.join(folder, post.basename[:50]) + "*.txt")) > 0
     if not config.getboolean('General', 'overwrite_existing') and exists:
+        if progress_tracker:
+            progress_tracker.increment('text', 'skipped')
         return
 
     # print(f't: {tpath}')
@@ -476,7 +644,8 @@ def text_save(post: Post):
         file.write("---\n\n")
         file.write(post.full_text)
 
-        file.close()
+    if progress_tracker:
+        progress_tracker.increment('text', 'downloaded')
 
 
 def parse_and_get(html_text: str) -> bool:
@@ -544,6 +713,10 @@ def parse_and_get(html_text: str) -> bool:
                 print(traceback.format_exc())
                 print("================================")
     
+    # Track posts found
+    if progress_tracker and post_count > 0:
+        progress_tracker.add_posts(post_count)
+
     return post_count > 0 # Return True if we found any posts
 
 
@@ -575,23 +748,28 @@ def process_page_worker():
     """
     Worker thread target. Continuously fetches and processes pages until the stop_event is set.
     """
+    thread_name = threading.current_thread().name
+
     while not stop_event.is_set():
         loopct = get_next_offset()
-        
+
+        if progress_tracker:
+            progress_tracker.set_activity(thread_name, f"Fetching page {loopct}...")
+
         try:
             html_text = get_html(loopct)
 
             if "as sad as you are" in html_text:
-                with print_lock:
-                    print(f"[Thread] No more posts found at offset {loopct}. Signaling stop.")
                 stop_event.set()  # Signal all other threads to stop
                 break  # Exit this thread's loop
             else:
+                # Track page processed
+                if progress_tracker:
+                    progress_tracker.increment_page()
+
                 # parse_and_get returns True if posts were found, False if not
                 if not parse_and_get(html_text):
                     # This can happen on empty pages at the end
-                    with print_lock:
-                         print(f"[Thread] Page offset {loopct} was empty or failed. Signaling stop.")
                     stop_event.set()
                     break
 
@@ -600,16 +778,24 @@ def process_page_worker():
             break
         except Exception:
             with print_lock:
-                print(f"[!] Error in thread for offset {loopct}:")
                 import traceback
                 print(traceback.format_exc())
             # Don't stop on an individual page error, just get the next one
             continue
 
+    # Clear activity when thread exits
+    if progress_tracker:
+        progress_tracker.clear_activity(thread_name)
+
 # --- Main execution block ---
 if __name__ == "__main__":
     config.read('config.ini')
     max_workers = max(int(config.get('General', 'max_workers')), 1)
+
+    # Initialize progress tracker
+    use_progress_bar = config.getboolean('General', 'use_progress_bar', fallback=True)
+    progress_tracker = ProgressTracker()
+    progress_tracker.set_enabled(use_progress_bar)
 
     if len(sys.argv) >= 2:
         user_hash = sys.argv[1]
@@ -618,7 +804,7 @@ if __name__ == "__main__":
     if len(sys.argv) >= 3:
         poster_id = sys.argv[2]
         print("(%s) Using poster ID from command line parameters." % poster_id)
-    
+
     if user_hash == "":
         user_hash = config.get('Authentication', 'user_hash')
 
@@ -635,25 +821,27 @@ if __name__ == "__main__":
         poster_id = config.get('Poster', 'poster_id', fallback="")
         if poster_id and len(sys.argv) < 3: # Only print if it came from config
             print("(%s) Using poster ID from config file." % poster_id)
-    
+
     # Set the global start offset
     current_offset = 0
-    
-    print(f"[Main] Starting download process with up to {max_workers} threads...")
+
+    print(f"Starting download with {max_workers} threads...")
+
+    # Start progress display
+    progress_tracker.start()
 
     # --- Dynamic Thread Pool Executor ---
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Submit one worker for each slot in the pool
             futures = [executor.submit(process_page_worker) for _ in range(max_workers)]
-            
+
             # This will wait for all threads to complete
             # Threads will complete when stop_event is set and they finish their last job
             concurrent.futures.wait(futures)
-            
+
     except KeyboardInterrupt:
-        print("\n[Main] Keyboard interrupt received. Shutting down threads...")
         stop_event.set()
         # The 'with' block will handle shutting down the executor
-        
-    print("[Main] All download threads have finished.")
+    finally:
+        progress_tracker.stop()
