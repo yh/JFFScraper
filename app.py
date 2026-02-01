@@ -15,10 +15,11 @@ import configparser
 import concurrent.futures
 import threading
 
-from rich.console import Console
+from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 # Force all subprocesses to use UTF-8, which prevents the 'charmap' codec errors
 os.environ['PYTHONIOENCODING'] = 'utf-8'
@@ -65,6 +66,13 @@ class ProgressTracker:
             'text': {'downloaded': 0, 'skipped': 0},
         }
 
+        # Track failed video names
+        self.failed_videos = []
+
+        # Uploader ID (discovered from first post, only shown in poster mode)
+        self.uploader_id = None
+        self._show_uploader_id = False
+
         # Current activity per thread
         self.activities = {}
 
@@ -74,25 +82,26 @@ class ProgressTracker:
 
     def _render(self) -> Panel:
         """Render the current progress display."""
-        table = Table.grid(padding=(0, 2))
-        table.add_column()
-        table.add_column(justify="right")
-        table.add_column(justify="right")
-        table.add_column(justify="right")
+        # Stats table
+        stats_table = Table.grid(padding=(0, 2))
+        stats_table.add_column()
+        stats_table.add_column(justify="right")
+        stats_table.add_column(justify="right")
+        stats_table.add_column(justify="right")
 
         # Summary row
-        table.add_row(
+        stats_table.add_row(
             f"Pages: {self.pages_processed}  |  Posts: {self.posts_found}",
             "", "", ""
         )
-        table.add_row("", "", "", "")
+        stats_table.add_row("", "", "", "")
 
         # Header row
-        table.add_row("", "Downloaded", "Skipped", "Failed")
+        stats_table.add_row("", "Downloaded", "Skipped", "Failed")
 
         # Photo row
         p = self.counters['photo']
-        table.add_row(
+        stats_table.add_row(
             "Photos:",
             str(p['downloaded']),
             str(p['skipped']),
@@ -101,7 +110,7 @@ class ProgressTracker:
 
         # Video row
         v = self.counters['video']
-        table.add_row(
+        stats_table.add_row(
             "Videos:",
             str(v['downloaded']),
             str(v['skipped']),
@@ -110,21 +119,30 @@ class ProgressTracker:
 
         # Text row
         t = self.counters['text']
-        table.add_row(
+        stats_table.add_row(
             "Texts:",
             str(t['downloaded']),
             str(t['skipped']),
             "N/A"
         )
 
-        # Activity section
-        if self.activities:
-            table.add_row("", "", "", "")
-            table.add_row("[bold]Current Activity:[/bold]", "", "", "")
-            for _, activity in sorted(self.activities.items()):
-                table.add_row(f"  {activity}", "", "", "")
+        # Panel title
+        title = f"JFFScraper - {self.uploader_id}" if self.uploader_id else "JFFScraper Progress"
 
-        return Panel(table, title="JFFScraper Progress", border_style="blue")
+        # Activity section (separate table)
+        if self.activities:
+            activity_table = Table.grid(padding=(0, 1))
+            activity_table.add_column()
+            for activity in self.activities.values():
+                activity_table.add_row(activity)
+
+            return Panel(
+                Group(stats_table, Text(), activity_table),
+                title=title,
+                border_style="blue"
+            )
+
+        return Panel(stats_table, title=title, border_style="blue")
 
     def start(self):
         """Start the live display."""
@@ -143,7 +161,8 @@ class ProgressTracker:
     def _print_summary(self):
         """Print final summary to console."""
         self.console.print()
-        self.console.print("[bold]Download Complete[/bold]")
+        title = f"Download Complete - {self.uploader_id}" if self.uploader_id else "Download Complete"
+        self.console.print(f"[bold]{title}[/bold]")
         self.console.print(f"  Pages processed: {self.pages_processed}")
         self.console.print(f"  Posts found: {self.posts_found}")
         self.console.print()
@@ -153,6 +172,13 @@ class ProgressTracker:
         self.console.print(f"  Videos: {v['downloaded']} downloaded, {v['skipped']} skipped, {v['failed']} failed")
         t = self.counters['text']
         self.console.print(f"  Texts: {t['downloaded']} downloaded, {t['skipped']} skipped")
+
+        # List failed videos
+        if self.failed_videos:
+            self.console.print()
+            self.console.print("[bold red]Failed Videos:[/bold red]")
+            for name in self.failed_videos:
+                self.console.print(f"  - {name}")
 
     def _update_display(self):
         """Update the live display if running."""
@@ -171,11 +197,14 @@ class ProgressTracker:
             self.posts_found += count
             self._update_display()
 
-    def increment(self, media_type: str, status: str):
+    def increment(self, media_type: str, status: str, name: str = None):
         """Increment a counter for the given media type and status."""
         with self.lock:
             if media_type in self.counters and status in self.counters[media_type]:
                 self.counters[media_type][status] += 1
+                # Track failed video names
+                if media_type == 'video' and status == 'failed' and name:
+                    self.failed_videos.append(name)
                 self._update_display()
 
     def set_activity(self, thread_name: str, activity: str):
@@ -189,6 +218,17 @@ class ProgressTracker:
         with self.lock:
             self.activities.pop(thread_name, None)
             self._update_display()
+
+    def set_uploader_id(self, uploader_id: str):
+        """Set the uploader ID (typically from first post)."""
+        with self.lock:
+            if not self.uploader_id and self._show_uploader_id:
+                self.uploader_id = uploader_id
+                self._update_display()
+
+    def enable_uploader_id_display(self):
+        """Enable showing uploader ID (for poster mode)."""
+        self._show_uploader_id = True
 
 
 # Global progress tracker (initialized in __main__)
@@ -502,8 +542,9 @@ def video_save(post: Post):
     try:
         videoBlock = post.post_soup.select("div.videoBlock a")
         if len(videoBlock) == 0:
-            if progress_tracker:
-                progress_tracker.increment('video', 'failed')
+            # Store posts (paid content) are not failures, just skip them
+            if post.store_url is None and progress_tracker:
+                progress_tracker.increment('video', 'failed', post.basename)
             return
         vidurljumble = videoBlock[0].attrs["onclick"]
 
@@ -555,6 +596,39 @@ def video_save(post: Post):
             return
 
         temp_path = os.path.join(folder, post.pid)
+
+        # Progress hook for yt-dlp
+        def ydl_progress_hook(d):
+            if not progress_tracker:
+                return
+            if d['status'] == 'downloading':
+                # Get progress info
+                total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
+                downloaded = d.get('downloaded_bytes', 0)
+                speed = d.get('speed') or 0
+
+                # Format progress string
+                if total > 0:
+                    pct = downloaded / total * 100
+                    pct_str = f"{pct:.0f}%"
+                else:
+                    pct_str = f"{downloaded / 1024 / 1024:.1f}MB"
+
+                if speed > 0:
+                    speed_str = f"{speed / 1024 / 1024:.1f}MB/s"
+                else:
+                    speed_str = "..."
+
+                progress_tracker.set_activity(
+                    thread_name,
+                    f"Video: {post.basename[:30]} [{pct_str} @ {speed_str}]"
+                )
+            elif d['status'] == 'finished':
+                progress_tracker.set_activity(
+                    thread_name,
+                    f"Video: {post.basename[:30]} [Processing...]"
+                )
+
         ydl_opts = {
             "quiet": True,
             "no_warnings": True,
@@ -566,7 +640,7 @@ def video_save(post: Post):
             "outtmpl": temp_path,
             "allow_unplayable_formats": True,
             "format": "bv*+ba/b",
-
+            "progress_hooks": [ydl_progress_hook],
         }
         with YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
@@ -575,12 +649,18 @@ def video_save(post: Post):
         search_pattern = f"{vpath_base}.f*"
         downloaded_files = glob.glob(search_pattern)
 
+        # Decrypt stage
+        if progress_tracker:
+            progress_tracker.set_activity(thread_name, f"Video: {post.basename[:30]} [Decrypting...]")
         for f_path in downloaded_files:
             decrypt_file_internal(f_path, hex_key)
 
         video_file = next((f for f in downloaded_files if f.endswith('.mp4')), None)
         audio_file = next((f for f in downloaded_files if f.endswith('.m4a') or f.endswith('.m4b')), None)
 
+        # Merge stage
+        if progress_tracker:
+            progress_tracker.set_activity(thread_name, f"Video: {post.basename[:30]} [Merging...]")
         merge_command = [
             'ffmpeg',
             '-i', video_file,
@@ -611,7 +691,7 @@ def video_save(post: Post):
         with print_lock:
             print(traceback.format_exc())
         if progress_tracker:
-            progress_tracker.increment('video', 'failed')
+            progress_tracker.increment('video', 'failed', post.basename)
 
 
 def text_save(post: Post):
@@ -668,6 +748,10 @@ def parse_and_get(html_text: str) -> bool:
 
             post = Post(pp)
             post_count += 1
+
+            # Set uploader_id on first post
+            if progress_tracker:
+                progress_tracker.set_uploader_id(post.uploader_id)
 
             # Insert post into database
             try:
@@ -804,6 +888,7 @@ if __name__ == "__main__":
     if len(sys.argv) >= 3:
         poster_id = sys.argv[2]
         print("(%s) Using poster ID from command line parameters." % poster_id)
+        progress_tracker.enable_uploader_id_display()
 
     if user_hash == "":
         user_hash = config.get('Authentication', 'user_hash')
