@@ -3,22 +3,32 @@
 ## About
 Script to scrape and download content from the JustFor.Fans website. Supports Text, Photo, and Video posts (as of 08/11/2025).
 
+## Requirements
+
+- Python 3.x
+- `ffmpeg` must be installed and available in PATH (required for video decryption and merging)
+
 ## Usage
 
 0. (optional) Create and activate a Python virtual environment:
-     ```
+    ```bash
     python -m venv venv
-    venv\Scripts\activate
+    source venv/bin/activate  # Unix/macOS
+    venv\Scripts\activate     # Windows
     ```
 1. Install requirements: `pip install -r requirements.txt`
-2. Set configuration
-    1. `overwrite_existing` - will skip download if file exists (keep this False to save on processing and downloading on subsequent runs)
-    2. `save_path` - destination folder - will save to same location as script folder if none provided
-    3. `save_full_text` - will save text file with full description
-    4. `file_name_format` - filename format, following values are available:
-        * `post_date`
-        * `post_id`
-        * `desc`
+2. Set configuration in `config.ini`:
+    - `overwrite_existing` - skip download if file exists (keep False to save on processing)
+    - `save_path` - destination folder (saves to script folder if not provided)
+    - `save_full_text` - save text file with full description for photo/video posts
+    - `max_workers` - number of concurrent page processing threads
+    - `concurrent_fragments` - number of concurrent video fragment downloads
+    - `use_progress_bar` - toggle rich progress display vs verbose logging
+    - `file_name_format` - filename format with placeholders:
+        * `{name}` - uploader ID
+        * `{post_date}` - post date
+        * `{post_id}` - post ID
+        * `{desc}` - post description excerpt
    
 3. Get UserHash (required) and PosterID  (optional) values
     1. Log into your JustFor.Fans account
@@ -36,6 +46,12 @@ Script to scrape and download content from the JustFor.Fans website. Supports Te
     * `python app.py`
 
 Note that leaving PosterID blank will result in the tool downloading all posts from all performers you are subscribed to.
+
+## Output Structure
+
+Downloads are organized as `{save_path}/{uploader_id}/{type}/` where type is `photo`, `video`, or `text`.
+
+Each uploader folder contains a `metadata.db` SQLite database storing post and media metadata for tracking and querying.
 
 ## Contributors
 
