@@ -9,7 +9,7 @@ import shutil
 import sys
 import urllib.parse
 import bs4
-import cloudscraper
+from curl_cffi import requests as curl_requests
 import subprocess
 import configparser
 import concurrent.futures
@@ -29,11 +29,7 @@ from database import Database
 
 # --- Globals ---
 config = configparser.ConfigParser(allow_no_value=True)
-scraper = cloudscraper.create_scraper(browser={
-        'browser': 'chrome',
-        'platform': 'android',
-        'desktop': False
-    })
+scraper = curl_requests.Session(impersonate="chrome")
 
 user_hash = ""
 poster_id = ""
@@ -475,8 +471,9 @@ def photo_save(post: Post):
             response = scraper.get(imgsrc, stream=True)
 
             with open(tmp_ppath, "wb") as out_file:
-                shutil.copyfileobj(response.raw, out_file)
-            del response
+                for chunk in response.iter_content():
+                    out_file.write(chunk)
+            response.close()
             os.rename(tmp_ppath, ppath)
 
             # Update media with file path and size
