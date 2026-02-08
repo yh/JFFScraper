@@ -17,7 +17,8 @@ import threading
 
 from rich.console import Console, Group
 from rich.live import Live
-from rich.panel import Panel
+from rich.progress_bar import ProgressBar
+from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
@@ -76,8 +77,10 @@ class ProgressTracker:
         """Enable or disable the progress display."""
         self._enabled = enabled
 
-    def _render(self) -> Panel:
+    def _render(self) -> Group:
         """Render the current progress display."""
+        title = f"JFFScraper - {self.uploader_id}" if self.uploader_id else "JFFScraper Progress"
+
         # Stats table
         stats_table = Table.grid(padding=(0, 2))
         stats_table.add_column()
@@ -122,23 +125,22 @@ class ProgressTracker:
             "N/A"
         )
 
-        # Panel title
-        title = f"JFFScraper - {self.uploader_id}" if self.uploader_id else "JFFScraper Progress"
+        parts = [Rule(title, style="blue"), stats_table]
 
-        # Activity section (separate table)
+        # Activity section
         if self.activities:
             activity_table = Table.grid(padding=(0, 1))
             activity_table.add_column()
-            for activity in self.activities.values():
-                activity_table.add_row(activity)
+            activity_table.add_column(width=20)
+            for activity_text, progress in self.activities.values():
+                if progress >= 0:
+                    bar = ProgressBar(total=1.0, completed=progress, width=20)
+                    activity_table.add_row(activity_text, bar)
+                else:
+                    activity_table.add_row(activity_text, Text(""))
+            parts.extend([Text(), activity_table])
 
-            return Panel(
-                Group(stats_table, Text(), activity_table),
-                title=title,
-                border_style="blue"
-            )
-
-        return Panel(stats_table, title=title, border_style="blue")
+        return Group(*parts)
 
     def start(self):
         """Start the live display."""
@@ -203,10 +205,10 @@ class ProgressTracker:
                     self.failed_videos.append(name)
                 self._update_display()
 
-    def set_activity(self, thread_name: str, activity: str):
-        """Set the current activity for a thread."""
+    def set_activity(self, thread_name: str, activity: str, progress: float = -1):
+        """Set the current activity for a thread. progress: 0.0-1.0 for bar, -1 for none."""
         with self.lock:
-            self.activities[thread_name] = activity
+            self.activities[thread_name] = (activity, progress)
             self._update_display()
 
     def clear_activity(self, thread_name: str):
@@ -604,22 +606,23 @@ def video_save(post: Post):
                 downloaded = d.get('downloaded_bytes', 0)
                 speed = d.get('speed') or 0
 
-                # Format progress string
-                if total > 0:
-                    pct = downloaded / total * 100
-                    pct_str = f"{pct:.0f}%"
-                else:
-                    pct_str = f"{downloaded / 1024 / 1024:.1f}MB"
-
                 if speed > 0:
                     speed_str = f"{speed / 1024 / 1024:.1f}MB/s"
                 else:
                     speed_str = "..."
 
-                progress_tracker.set_activity(
-                    thread_name,
-                    f"Video: {post.basename[:30]} [{pct_str} @ {speed_str}]"
-                )
+                if total > 0:
+                    progress = downloaded / total
+                    progress_tracker.set_activity(
+                        thread_name,
+                        f"Video: {post.basename[:30]} [{speed_str}]",
+                        progress=progress
+                    )
+                else:
+                    progress_tracker.set_activity(
+                        thread_name,
+                        f"Video: {post.basename[:30]} [{downloaded / 1024 / 1024:.1f}MB @ {speed_str}]"
+                    )
             elif d['status'] == 'finished':
                 progress_tracker.set_activity(
                     thread_name,
