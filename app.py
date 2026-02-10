@@ -236,8 +236,7 @@ progress_tracker: ProgressTracker = None
 def get_db(uploader_id: str) -> Database:
     """Get or create the database for a specific uploader."""
     db_dir = os.path.join(config.get('Paths', 'save_path'), uploader_id)
-    if not os.path.exists(db_dir):
-        os.makedirs(db_dir)
+    os.makedirs(db_dir, exist_ok=True)
     db_path = os.path.join(db_dir, 'metadata.db')
     return Database.get_instance(db_path)
 
@@ -408,8 +407,7 @@ class Post:
 
 def create_folder(post: Post) -> str:
     fpath = os.path.join(config.get('Paths', 'save_path'), post.uploader_id, post.type)
-    if not os.path.exists(fpath):
-        os.makedirs(fpath)
+    os.makedirs(fpath, exist_ok=True)
     return fpath
 
 
@@ -815,8 +813,12 @@ def get_html(loopct: int) -> str:
             hash=user_hash, seq=loopct,
         )
 
-    html_text = scraper.get(geturl).text
-    return html_text
+    try:
+        html_text = scraper.get(geturl).text
+        return html_text
+    except:
+        print(f"Error fetching URL: {geturl}")
+        raise
 
 # --- Thread-safe offset getter ---
 def get_next_offset() -> int:

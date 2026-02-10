@@ -6,6 +6,7 @@ Stores post metadata and media information.
 import json
 import sqlite3
 import threading
+import time
 from typing import Optional
 
 
@@ -30,13 +31,21 @@ class Database:
         self._init_schema()
 
     def _get_connection(self) -> sqlite3.Connection:
-        """Get thread-local database connection."""
+        """Get thread-local database connection with retry for transient I/O errors."""
         if not hasattr(self._local, 'connection') or self._local.connection is None:
-            conn = sqlite3.connect(self._db_path, check_same_thread=False)
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=DELETE")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            self._local.connection = conn
+            for attempt in range(3):
+                try:
+                    conn = sqlite3.connect(self._db_path, timeout=10, check_same_thread=False)
+                    conn.row_factory = sqlite3.Row
+                    conn.execute("PRAGMA journal_mode=DELETE")
+                    conn.execute("PRAGMA synchronous=NORMAL")
+                    conn.execute("PRAGMA busy_timeout=5000")
+                    self._local.connection = conn
+                    break
+                except sqlite3.OperationalError:
+                    if attempt == 2:
+                        raise
+                    time.sleep(0.5 * (attempt + 1))
         return self._local.connection
 
     def _init_schema(self):
